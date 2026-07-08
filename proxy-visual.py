@@ -1,7 +1,9 @@
 import time
+import io
 
 import streamlit as st
 import pandas as pd
+import altair as alt
 from datetime import datetime
 
 st.title("ノードイベントビューア")
@@ -17,14 +19,37 @@ def parse_time_to_seconds(t: str) -> float:
 
 
 if uploaded_file is not None:
-    # 区切り文字: カンマ・タブ・空白など自動判定
-    df = pd.read_csv(
-        uploaded_file,
-        sep=None,
-        engine="python",
-        header=None,
-        names=["time_str", "node_id", "segment", "code", "req_type"],
-    )
+    # 区切り文字の自動判定(sep=None)は、桁揃え用の余分なスペースなどがあると
+    # 誤判定して列がずれることがあるため、候補を順に試して
+    # 想定の5列(時刻,ノードID,セグメント,コード値,creq/pres)に一致するものを採用する
+    raw_text = uploaded_file.getvalue().decode("utf-8", errors="replace")
+    COLUMN_NAMES = ["time_str", "node_id", "segment", "code", "req_type"]
+    SEP_CANDIDATES = [",", "\t", r"\s+"]
+
+    df = None
+    for sep in SEP_CANDIDATES:
+        try:
+            candidate = pd.read_csv(
+                io.StringIO(raw_text),
+                sep=sep,
+                engine="python",
+                header=None,
+                names=COLUMN_NAMES,
+            )
+        except Exception:
+            continue
+        # 列数が一致していても、実際には分割できておらず欠損値で埋められている
+        # だけのケースがあるため、NaNが含まれていないことも確認する
+        if candidate.shape[1] == len(COLUMN_NAMES) and not candidate.isna().any().any():
+            df = candidate
+            break
+
+    if df is None:
+        st.error(
+            "列数が想定(5列: 時刻,ノードID,セグメント,コード値,creq/pres)と一致せず、"
+            "区切り文字の判定に失敗しました。ファイル形式をご確認ください。"
+        )
+        st.stop()
 
     # 文字列の前後空白を除去
     df["time_str"] = df["time_str"].astype(str).str.strip()
@@ -33,6 +58,12 @@ if uploaded_file is not None:
     df["code"] = pd.to_numeric(df["code"], errors="coerce")
     # 5列目は preq(要求)/pres(応答受信) を区別するために使用する。
     df["req_type"] = df["req_type"].astype(str).str.strip()
+
+    with st.expander("読み込み結果の確認（デバッグ用）"):
+        st.write("先頭10行:")
+        st.dataframe(df.head(10), use_container_width=True)
+        st.write("コード値ごとの件数(この数値が実際のログの分布と一致するか確認してください):")
+        st.write(df["code"].value_counts())
 
     try:
         df["abs_sec"] = df["time_str"].apply(parse_time_to_seconds)
@@ -125,6 +156,39 @@ if uploaded_file is not None:
         idx = nearby_numeric.groupby("node_num")["|Δt| (秒)"].idxmin()
         nearest_rows = nearby_numeric.loc[idx].set_index("node_num")
         nearest_per_node = nearest_rows[["|Δt| (秒)", "segment", "code"]].to_dict(orient="index")
+
+    with st.expander("ノード状態の色マッピング確認（デバッグ用）"):
+        debug_rows = []
+        for node_num, info in sorted(nearest_per_node.items()):
+            code_val = info["code"]
+            style = (
+                CODE_COLORS.get(int(code_val), UNKNOWN_CODE_STYLE)
+                if pd.notna(code_val)
+                else UNKNOWN_CODE_STYLE
+            )
+            debug_rows.append(
+                {
+                    "ノードID": node_num,
+                    "採用されたコード値": code_val,
+                    "色": style["label"],
+                    "|Δt|(秒)": info["|Δt| (秒)"],
+                }
+            )
+        if debug_rows:
+            st.dataframe(pd.DataFrame(debug_rows), use_container_width=True)
+        else:
+            st.write("この時刻の±1秒以内にイベントがあるノードがありません。")
+
+        # 同一ノードに対して短時間に複数の異なるコード値が来ているケースを検出
+        multi_code = (
+            nearby_numeric.groupby("node_num")["code"]
+            .nunique()
+            .reset_index(name="コード値の種類数")
+        )
+        multi_code = multi_code[multi_code["コード値の種類数"] > 1]
+        if not multi_code.empty:
+            st.write("同じ±1秒の範囲内に複数の異なるコード値を持つノード(採用漏れの原因になりえます):")
+            st.dataframe(multi_code, use_container_width=True)
 
     def resolve_box_style(info):
         """直近イベント情報(info)から (背景色, 枠線色, 文字色, 表示テキスト) を求める"""
@@ -239,6 +303,80 @@ if uploaded_file is not None:
     st.markdown(top_box_html, unsafe_allow_html=True)
     st.markdown(grid_html, unsafe_allow_html=True)
     st.markdown(legend_html, unsafe_allow_html=True)
+
+    # --- ノードごとのイベント発生状況グラフ(横軸:時間, 縦軸:ノードID, 色:コード値) ---
+    st.subheader("ノードごとのイベント発生状況")
+
+    def rgb_to_hex(rgb):
+        return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+    # ノードIDごとに (時刻, コード値, セグメント番号) のリストを持たせ、時刻でソートしておく
+    # (セグメント番号は現時点ではグラフに使用しない)
+    df_numeric = df.copy()
+    df_numeric["node_num"] = pd.to_numeric(df_numeric["node_id"], errors="coerce")
+    df_numeric = df_numeric.dropna(subset=["node_num"])
+
+    events_by_node = {}
+    for node_num, group in df_numeric.groupby("node_num"):
+        events_by_node[node_num] = sorted(
+            zip(group["rel_sec"], group["code"], group["segment"]),
+            key=lambda item: item[0],
+        )
+
+    # 「指定時刻より前」だが、指定時刻の前後1秒(ウィンドウ)分は含めるため、
+    # しきい値は 選択時刻 + ウィンドウ(1秒) とする
+    chart_threshold = selected_sec + window
+    chart_rows = []
+    for node_num, events in events_by_node.items():
+        for t, code, _segment in events:
+            if t <= chart_threshold:
+                style = (
+                    CODE_COLORS.get(int(code), UNKNOWN_CODE_STYLE)
+                    if pd.notna(code)
+                    else UNKNOWN_CODE_STYLE
+                )
+                chart_rows.append(
+                    {
+                        "経過秒数": t,
+                        "ノードID": node_num,
+                        "color": rgb_to_hex(style["rgb"]),
+                    }
+                )
+
+    if chart_rows:
+        chart_df = pd.DataFrame(chart_rows)
+
+        # st.scatter_chart はマーカーサイズを細かく制御できず、
+        # 点が密集すると後から描画された色が下の色を覆い隠してしまう(オーバープロット)。
+        # altair_chart を使い、マーカーを小さく・半透明にすることでこれを緩和する。
+        chart = (
+            alt.Chart(chart_df)
+            .mark_circle(size=16, opacity=0.75)
+            .encode(
+                x=alt.X("経過秒数:Q", title="経過秒数"),
+                y=alt.Y("ノードID:Q", title="ノードID"),
+                color=alt.Color("color:N", scale=None, legend=None),
+                tooltip=["経過秒数", "ノードID"],
+            )
+        )
+        st.altair_chart(chart, use_container_width=True)
+        st.caption(
+            "点の色は凡例（720p=青 / 480p=オレンジ / 360p=緑 / 240p=赤）に対応しています。"
+            "点が密集する場合は重なって見えることがあります。"
+        )
+
+        # グラフに実際に渡しているデータの色の内訳を確認する(ノード状態と食い違う場合の切り分け用)
+        color_label_map = {
+            rgb_to_hex(style["rgb"]): style["label"] for style in CODE_COLORS.values()
+        }
+        color_label_map[rgb_to_hex(UNKNOWN_CODE_STYLE["rgb"])] = UNKNOWN_CODE_STYLE["label"]
+        with st.expander("グラフのデータ内訳確認（デバッグ用）"):
+            st.write(f"グラフに含まれる点の総数: {len(chart_df)} 件")
+            counts = chart_df["color"].value_counts().rename(index=color_label_map)
+            st.write("色ごとの件数(この時点までの累積):")
+            st.write(counts)
+    else:
+        st.info("表示できるイベントがまだありません。")
 
     st.subheader(f"選択時刻 ±{window:.0f} 秒 のイベント ({len(nearby)} 件)")
     st.dataframe(
