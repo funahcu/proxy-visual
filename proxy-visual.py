@@ -59,12 +59,6 @@ if uploaded_file is not None:
     # 5列目は preq(要求)/pres(応答受信) を区別するために使用する。
     df["req_type"] = df["req_type"].astype(str).str.strip()
 
-    with st.expander("読み込み結果の確認（デバッグ用）"):
-        st.write("先頭10行:")
-        st.dataframe(df.head(10), use_container_width=True)
-        st.write("コード値ごとの件数(この数値が実際のログの分布と一致するか確認してください):")
-        st.write(df["code"].value_counts())
-
     try:
         df["abs_sec"] = df["time_str"].apply(parse_time_to_seconds)
     except ValueError as e:
@@ -156,39 +150,6 @@ if uploaded_file is not None:
         idx = nearby_numeric.groupby("node_num")["|Δt| (秒)"].idxmin()
         nearest_rows = nearby_numeric.loc[idx].set_index("node_num")
         nearest_per_node = nearest_rows[["|Δt| (秒)", "segment", "code"]].to_dict(orient="index")
-
-    with st.expander("ノード状態の色マッピング確認（デバッグ用）"):
-        debug_rows = []
-        for node_num, info in sorted(nearest_per_node.items()):
-            code_val = info["code"]
-            style = (
-                CODE_COLORS.get(int(code_val), UNKNOWN_CODE_STYLE)
-                if pd.notna(code_val)
-                else UNKNOWN_CODE_STYLE
-            )
-            debug_rows.append(
-                {
-                    "ノードID": node_num,
-                    "採用されたコード値": code_val,
-                    "色": style["label"],
-                    "|Δt|(秒)": info["|Δt| (秒)"],
-                }
-            )
-        if debug_rows:
-            st.dataframe(pd.DataFrame(debug_rows), use_container_width=True)
-        else:
-            st.write("この時刻の±1秒以内にイベントがあるノードがありません。")
-
-        # 同一ノードに対して短時間に複数の異なるコード値が来ているケースを検出
-        multi_code = (
-            nearby_numeric.groupby("node_num")["code"]
-            .nunique()
-            .reset_index(name="コード値の種類数")
-        )
-        multi_code = multi_code[multi_code["コード値の種類数"] > 1]
-        if not multi_code.empty:
-            st.write("同じ±1秒の範囲内に複数の異なるコード値を持つノード(採用漏れの原因になりえます):")
-            st.dataframe(multi_code, use_container_width=True)
 
     def resolve_box_style(info):
         """直近イベント情報(info)から (背景色, 枠線色, 文字色, 表示テキスト) を求める"""
@@ -318,6 +279,8 @@ if uploaded_file is not None:
 
     events_by_node = {}
     for node_num, group in df_numeric.groupby("node_num"):
+        if node_num == -1.0:
+            continue  # 上位ノードは専用グラフに分離して表示する
         events_by_node[node_num] = sorted(
             zip(group["rel_sec"], group["code"], group["segment"]),
             key=lambda item: item[0],
@@ -365,18 +328,78 @@ if uploaded_file is not None:
             "点が密集する場合は重なって見えることがあります。"
         )
 
-        # グラフに実際に渡しているデータの色の内訳を確認する(ノード状態と食い違う場合の切り分け用)
-        color_label_map = {
-            rgb_to_hex(style["rgb"]): style["label"] for style in CODE_COLORS.values()
-        }
-        color_label_map[rgb_to_hex(UNKNOWN_CODE_STYLE["rgb"])] = UNKNOWN_CODE_STYLE["label"]
-        with st.expander("グラフのデータ内訳確認（デバッグ用）"):
-            st.write(f"グラフに含まれる点の総数: {len(chart_df)} 件")
-            counts = chart_df["color"].value_counts().rename(index=color_label_map)
-            st.write("色ごとの件数(この時点までの累積):")
-            st.write(counts)
     else:
         st.info("表示できるイベントがまだありません。")
+
+    # --- 上位ノード(node_id = -1)とのやり取りグラフ(横軸:時間, 縦軸:セグメント番号) ---
+    st.subheader("上位ノードとのイベント発生状況（要求 / 応答受信）")
+
+    SEGMENT_Y_OFFSET = 0.15  # 要求(上)と応答受信(下)を少しだけ縦にずらして重ならないようにする
+
+    top_numeric = df_numeric[df_numeric["node_num"] == -1.0].copy()
+    top_numeric["segment_num"] = pd.to_numeric(top_numeric["segment"], errors="coerce")
+    top_numeric = top_numeric.dropna(subset=["segment_num"])
+    top_numeric = top_numeric[top_numeric["rel_sec"] <= chart_threshold]
+
+    def build_top_rows(subset_df, y_offset):
+        rows = []
+        for _, row in subset_df.iterrows():
+            code_val = row["code"]
+            style = (
+                CODE_COLORS.get(int(code_val), UNKNOWN_CODE_STYLE)
+                if pd.notna(code_val)
+                else UNKNOWN_CODE_STYLE
+            )
+            rows.append(
+                {
+                    "経過秒数": row["rel_sec"],
+                    "y位置": row["segment_num"] + y_offset,
+                    "セグメント番号": row["segment_num"],
+                    "color": rgb_to_hex(style["rgb"]),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    preq_df = build_top_rows(top_numeric[top_numeric["req_type"] == "preq"], SEGMENT_Y_OFFSET)
+    pres_df = build_top_rows(top_numeric[top_numeric["req_type"] == "pres"], -SEGMENT_Y_OFFSET)
+
+    if not preq_df.empty or not pres_df.empty:
+        layers = []
+        if not preq_df.empty:
+            # 要求(preq): 白抜き(open)の○
+            layers.append(
+                alt.Chart(preq_df)
+                .mark_point(shape="circle", filled=False, size=16, opacity=0.85, strokeWidth=1.3)
+                .encode(
+                    x=alt.X("経過秒数:Q", title="経過秒数"),
+                    y=alt.Y("y位置:Q", title="セグメント番号"),
+                    color=alt.Color("color:N", scale=None, legend=None),
+                    tooltip=["経過秒数", "セグメント番号"],
+                )
+            )
+        if not pres_df.empty:
+            # 応答受信(pres): 塗りつぶし(closed)の●
+            layers.append(
+                alt.Chart(pres_df)
+                .mark_circle(size=16, opacity=0.85)
+                .encode(
+                    x=alt.X("経過秒数:Q", title="経過秒数"),
+                    y=alt.Y("y位置:Q", title="セグメント番号"),
+                    color=alt.Color("color:N", scale=None, legend=None),
+                    tooltip=["経過秒数", "セグメント番号"],
+                )
+            )
+        top_chart = layers[0]
+        for layer in layers[1:]:
+            top_chart = top_chart + layer
+        st.altair_chart(top_chart, use_container_width=True)
+        st.caption(
+            "○（白抜き）=要求(preq)、●（塗りつぶし）=応答受信(pres)。"
+            "各セグメント番号の少し上に要求、少し下に応答受信を表示しています。"
+            "色は他のグラフと同じ凡例（720p=青 / 480p=オレンジ / 360p=緑 / 240p=赤）です。"
+        )
+    else:
+        st.info("上位ノードのイベントはまだありません。")
 
     st.subheader(f"選択時刻 ±{window:.0f} 秒 のイベント ({len(nearby)} 件)")
     st.dataframe(
